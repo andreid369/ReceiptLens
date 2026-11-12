@@ -349,3 +349,16 @@ aws cloudformation delete-stack --stack-name receiptlens-bootstrap
 - Custom domain with ACM certificate and TLS 1.2+ policy
 - Step Functions for multi-page PDFs split per page
 - e-Factura (ANAF SPV) XML import, so B2B invoices skip OCR entirely
+
+## License
+
+Copyright 2026 Andrei ([andreid369](https://github.com/andreid369)).
+
+ReceiptLens is licensed under the [Apache License 2.0](LICENSE). You may use, modify and share the code, including commercially, as long as you:
+
+- **keep the copyright notice and the [NOTICE](NOTICE) file**, which credit the original author;
+- include a copy of the license;
+- state which files you changed.
+
+The license comes with no warranty.
+
