@@ -1,6 +1,7 @@
 AWSTemplateFormatVersion: "2010-09-09"
 Description: >
-  ReceiptLens bootstrap (deploy once, with admin rights, e.g. from CloudShell).
+  ReceiptLens bootstrap (deploy once, with admin rights, e.g. from CloudShell),
+  in the SAME region as the app stack (eu-central-1 by default).
   Creates what GitHub Actions needs before it can deploy anything: the GitHub
   OIDC provider, a change-set ("plan") role for pull requests, a deploy role for
   the protected prod environment, the CloudFormation execution role, and the

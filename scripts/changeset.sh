@@ -18,8 +18,23 @@ stack_status() {
     --query 'Stacks[0].StackStatus' --output text 2>/dev/null || echo "NONE"
 }
 
+check_region() {
+  # The artifacts bucket and the roles' permissions are tied to the region the
+  # bootstrap was deployed in; Lambda can only load code from a same-region bucket.
+  local bucket_region
+  bucket_region="$(aws s3api get-bucket-location --bucket "$ARTIFACTS_BUCKET" \
+    --query LocationConstraint --output text)"
+  [[ "$bucket_region" == "None" || "$bucket_region" == "null" ]] && bucket_region="us-east-1"
+  if [[ "$bucket_region" != "$AWS_REGION" ]]; then
+    echo "::error::Bootstrap is in $bucket_region but the pipeline deploys to $AWS_REGION."
+    echo "Redeploy the bootstrap with --region $AWS_REGION (see README, Troubleshooting)."
+    exit 1
+  fi
+}
+
 create() {
   local status type reason
+  check_region
   aws cloudformation package \
     --template-file "$TEMPLATE" \
     --s3-bucket "$ARTIFACTS_BUCKET" \

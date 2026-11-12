@@ -88,9 +88,9 @@ GitHub can only log in to AWS through OIDC once the OIDC provider and the IAM ro
 - In the Bedrock console for your region, open the model catalog and confirm **Amazon Nova Lite** is available. Using a different model? See *Changing the model* below.
 
 ### 1. Bootstrap, once, from AWS CloudShell
-Open CloudShell in the console. It is already signed in as you, so you need no keys on your laptop. Upload `bootstrap/bootstrap.yaml` or clone the repo, then run:
+Open CloudShell in the console, **in the same region as the app (eu-central-1)**. It is already signed in as you, so you need no keys on your laptop. Upload `bootstrap/bootstrap.yaml` or clone the repo, then run:
 ```bash
-aws cloudformation deploy \
+aws cloudformation deploy --region eu-central-1 \
   --stack-name receiptlens-bootstrap \
   --template-file bootstrap/bootstrap.yaml \
   --capabilities CAPABILITY_NAMED_IAM \
@@ -100,6 +100,8 @@ aws cloudformation describe-stacks --stack-name receiptlens-bootstrap \
   --query 'Stacks[0].Outputs[].[OutputKey,OutputValue]' --output table
 ```
 `GitHubOwner` and `GitHubRepo` must match GitHub exactly, including capitalisation: the role trust check is case-sensitive.
+
+Always pass `--region eu-central-1` (the app region), even if your CLI's default region is different. The artifacts bucket and the roles' CloudFormation permissions belong to the region where the bootstrap is deployed, and Lambda can only load code from a bucket in its own region.
 
 #### If GitHub sends the OIDC subject with numeric IDs
 Some accounts send the token's `sub` with immutable IDs, in the form `repo:<owner>@<owner-id>/<repo>@<repo-id>:ref:refs/heads/main`, instead of `repo:<owner>/<repo>:ref:refs/heads/main`. The first pipeline run then fails with `Not authorized to perform sts:AssumeRoleWithWebIdentity`. To fix it:
@@ -113,7 +115,7 @@ aws cloudtrail lookup-events --region eu-central-1 \
 #    → repo:alice@1234567/ReceiptLens@98765432:ref:refs/heads/main
 
 # 2. Redeploy the bootstrap with everything BEFORE ":ref:" as the prefix
-aws cloudformation deploy --stack-name receiptlens-bootstrap \
+aws cloudformation deploy --region eu-central-1 --stack-name receiptlens-bootstrap \
   --template-file bootstrap/bootstrap.yaml --capabilities CAPABILITY_NAMED_IAM \
   --parameter-overrides GitHubOwner=alice GitHubRepo=ReceiptLens \
     GitHubSubjectPrefix='repo:alice@1234567/ReceiptLens@98765432'
@@ -138,7 +140,7 @@ aws iam list-open-id-connect-providers
 #    → arn:aws:iam::<account-id>:oidc-provider/token.actions.githubusercontent.com
 
 # 2. Deploy again, passing that ARN
-aws cloudformation deploy \
+aws cloudformation deploy --region eu-central-1 \
   --stack-name receiptlens-bootstrap \
   --template-file bootstrap/bootstrap.yaml \
   --capabilities CAPABILITY_NAMED_IAM \
@@ -268,6 +270,7 @@ Problems hit during real deployments of this project, in the order they tend to 
 | --- | --- | --- |
 | Bootstrap: `Failed to create the changeset ... [AWS::EarlyValidation::ResourceExistenceCheck]` | A resource with the same name already exists. Usually the GitHub OIDC provider, which the account can hold only once. | Pass `ExistingOidcProviderArn=...` (see *If the account already has a GitHub OIDC provider*). The stack stays in `REVIEW_IN_PROGRESS` meanwhile, which is harmless. |
 | Pipeline: `Could not assume role with OIDC: Not authorized to perform sts:AssumeRoleWithWebIdentity` | The token from GitHub doesn't match the role's trust policy. | Work through the checks below. |
+| Create change set: `not authorized to perform: cloudformation:CreateChangeSet on resource: ...:stack/receiptlens-prod/*` (or the pipeline says *Bootstrap is in us-east-1 but the pipeline deploys to eu-central-1*) | The bootstrap was deployed in the CLI's default region instead of `eu-central-1`, so the role permissions and the artifacts bucket are in the wrong region. | Empty the artifacts bucket (including object versions), delete the `receiptlens-bootstrap` stack in the wrong region, and redeploy it with `--region eu-central-1`. Role and bucket names stay the same, so the GitHub variables don't change. |
 | Pipeline: `scripts/changeset.sh: Permission denied` (exit 126) | The repo was committed from Windows, so the scripts lost their executable bit. | The workflow calls scripts through `bash`, so this is already handled. Also run `git update-index --chmod=+x scripts/*.sh` and commit. |
 | `git push` rejected: *refusing to allow a Personal Access Token to create or update workflow* | The token lacks the `workflow` scope. | Use a token with `repo` + `workflow`, a fine-grained token with *Workflows: Read and write*, or Git Credential Manager. |
 | Bootstrap `deploy` says *No changes to deploy* after you fixed a value | The parameter values you passed are the same as before. | Check the parameter overrides you passed and confirm the result with `aws iam get-role` (below). |
