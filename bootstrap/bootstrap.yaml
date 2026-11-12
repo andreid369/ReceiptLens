@@ -48,7 +48,7 @@ Resources:
   ArtifactsBucket:
     Type: AWS::S3::Bucket
     Properties:
-      BucketName: !Sub "${Project}-artifacts-${AWS::AccountId}"
+      BucketName: !Sub "${Project}-artifacts-${AWS::AccountId}-${AWS::Region}"
       BucketEncryption:
         ServerSideEncryptionConfiguration:
           - ServerSideEncryptionByDefault:
