@@ -10,31 +10,11 @@ Turn a photo or PDF of a receipt or invoice into validated expense data, on a se
 
 ## Architecture
 
-```
-Browser ──► CloudFront + S3 (web app)
-   │
-   ├─► Cognito (hosted UI, PKCE) ──► access token
-   │
-   ├─► API Gateway HTTP API (JWT authorizer) ──► Lambda api
-   │        POST /uploads → presigned S3 POST (type + size limited)
-   │        GET  /expenses, /expenses/{id}, /export (CSV)
-   │
-   └─► S3 documents bucket (direct upload, uploads/<tenant>/<doc>/<file>)
-            │ Object Created
-            ▼
-        EventBridge rule ──► SQS queue (+ DLQ after 3 failures)
-                                 │ max concurrency 2
-                                 ▼
-                          Lambda extractor
-                            1. Bedrock Converse (image/PDF → forced tool call → JSON)
-                            2. validate totals, VAT (RO rates), dates
-                            3. Textract AnalyzeExpense fallback if invalid
-                            4. DynamoDB: EXTRACTED or NEEDS_REVIEW
-                            5. EMF metrics: documents, tokens, fallbacks
+![ReceiptLens architecture on AWS](docs/architecture.png)
 
-CloudWatch: alarms (DLQ, errors, 5xx, token spike) → SNS email · dashboard · X-Ray
-AWS Budgets: monthly budget with 80% actual / 100% forecast alerts
-```
+Numbered steps: (1) sign in with Cognito, (2) ask the API for an upload URL, (3) upload straight to S3, (4) the S3 event goes to the queue, (5) the extractor reads the document with Bedrock, validates it and falls back to Textract only if needed, (6) the result is saved to DynamoDB, (7) the app lists and exports expenses.
+
+The editable source is [`docs/architecture.drawio`](docs/architecture.drawio): open it in [diagrams.net](https://app.diagrams.net) or the VS Code Draw.io extension. The icons come from the official AWS Architecture Icons package.
 
 | Service | Why it's here |
 | --- | --- |
@@ -66,6 +46,7 @@ tests/                    pytest unit tests
 .github/workflows/        CI (lint, tests, cfn-lint, Checkov) and Deploy (change set on PR, execute on main)
 .github/dependabot.yml    Weekly updates for GitHub Actions versions
 docs/DEPLOYMENT.md        How to use and operate the deployment
+docs/architecture.*       Architecture diagram (PNG for the README, .drawio to edit)
 .checkov.yaml             Accepted security findings, each with its reason
 ```
 
