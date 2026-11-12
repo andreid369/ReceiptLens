@@ -6,6 +6,8 @@ Turn a photo or PDF of a receipt or invoice into validated expense data, on a se
 
 **Solution.** A Bedrock vision model reads the document and returns strict JSON. Business rules check the totals, VAT and dates. Only documents that fail validation fall back to Textract.
 
+**Docs:** this README covers the architecture and the one-time setup. Day-to-day use (shipping changes, users, monitoring, rollback, teardown, demo checklist) is in [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md).
+
 ## Architecture
 
 ```
@@ -62,6 +64,8 @@ scripts/changeset.sh      Package code, create / execute / delete change sets
 scripts/publish-web.sh    Upload the web app with config.js built from stack outputs
 tests/                    pytest unit tests
 .github/workflows/        CI (lint, tests, cfn-lint, Checkov) and Deploy (change set on PR, execute on main)
+.github/dependabot.yml    Weekly updates for GitHub Actions versions
+docs/DEPLOYMENT.md        How to use and operate the deployment
 .checkov.yaml             Accepted security findings, each with its reason
 ```
 
@@ -77,6 +81,10 @@ tests/                    pytest unit tests
   - On `main`, the same kind of change set is created and shown in the job summary. After approval, the deploy job executes exactly that change set.
 - **No state bucket.** CloudFormation keeps the state of the stack itself, so there is no state file to store, lock or lose.
 - **Checks on every change.** cfn-lint and shellcheck lint the templates and scripts. Checkov fails the build on any finding not listed in `.checkov.yaml`, and every listed skip states its reason.
+- **Reproducible runners.**
+  - Jobs run on a pinned `ubuntu-24.04` image, not `ubuntu-latest`, so a runner OS migration can't change builds unannounced. Moving to `ubuntu-26.04` is a deliberate one-line PR.
+  - Actions use their Node 24 major versions (`checkout@v7`, `setup-python@v7`, `configure-aws-credentials@v6`), and Dependabot proposes updates weekly.
+  - PR comments use the preinstalled `gh` CLI instead of a third-party action.
 
 ## First deployment
 
