@@ -17,6 +17,13 @@ Parameters:
     Type: String
     Default: receiptlens
     AllowedPattern: "^[a-z0-9-]+$"
+  GitHubSubjectPrefix:
+    Type: String
+    Default: ""
+    Description: >
+      Optional. The OIDC "sub" up to (not including) ":ref:" / ":environment:",
+      exactly as GitHub sends it, e.g. repo:owner@123/Repo@456 when the token
+      uses immutable IDs. Empty = repo:<GitHubOwner>/<GitHubRepo>.
   ExistingOidcProviderArn:
     Type: String
     Default: ""
@@ -26,6 +33,7 @@ Parameters:
 
 Conditions:
   CreateOidcProvider: !Equals [!Ref ExistingOidcProviderArn, ""]
+  UseSubjectPrefix: !Not [!Equals [!Ref GitHubSubjectPrefix, ""]]
 
 Resources:
   GitHubOidcProvider:
@@ -147,8 +155,12 @@ Resources:
               StringEquals:
                 token.actions.githubusercontent.com:aud: sts.amazonaws.com
                 token.actions.githubusercontent.com:sub:
-                  - !Sub "repo:${GitHubOwner}/${GitHubRepo}:pull_request"
-                  - !Sub "repo:${GitHubOwner}/${GitHubRepo}:ref:refs/heads/main"
+                  - !Sub
+                    - "${Prefix}:pull_request"
+                    - Prefix: !If [UseSubjectPrefix, !Ref GitHubSubjectPrefix, !Sub "repo:${GitHubOwner}/${GitHubRepo}"]
+                  - !Sub
+                    - "${Prefix}:ref:refs/heads/main"
+                    - Prefix: !If [UseSubjectPrefix, !Ref GitHubSubjectPrefix, !Sub "repo:${GitHubOwner}/${GitHubRepo}"]
       ManagedPolicyArns:
         - !Sub "arn:${AWS::Partition}:iam::aws:policy/ReadOnlyAccess"
       Policies:
@@ -195,7 +207,9 @@ Resources:
             Condition:
               StringEquals:
                 token.actions.githubusercontent.com:aud: sts.amazonaws.com
-                token.actions.githubusercontent.com:sub: !Sub "repo:${GitHubOwner}/${GitHubRepo}:environment:prod"
+                token.actions.githubusercontent.com:sub: !Sub
+                  - "${Prefix}:environment:prod"
+                  - Prefix: !If [UseSubjectPrefix, !Ref GitHubSubjectPrefix, !Sub "repo:${GitHubOwner}/${GitHubRepo}"]
       Policies:
         - PolicyName: deploy
           PolicyDocument:
