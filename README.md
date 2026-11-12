@@ -163,7 +163,13 @@ aws iam add-client-id-to-open-id-connect-provider \
 ```
 
 ### 2. Configure the GitHub repository
-Under **Settings → Secrets and variables → Actions**:
+Read the bootstrap outputs, from CloudShell or **CloudFormation → receiptlens-bootstrap → Outputs**:
+```bash
+aws cloudformation describe-stacks --stack-name receiptlens-bootstrap \
+  --query 'Stacks[0].Outputs[].[OutputKey,OutputValue]' --output table
+```
+
+In the repo, under **Settings → Secrets and variables → Actions**:
 
 | Type | Name | Value |
 | --- | --- | --- |
@@ -174,26 +180,74 @@ Under **Settings → Secrets and variables → Actions**:
 | Variable | `ARTIFACTS_BUCKET` | `ArtifactsBucket` output |
 | Secret | `ALERT_EMAIL` | where alarms and budget alerts go |
 
-Under **Settings → Environments**, create `prod` and add yourself as a required reviewer.
+The role ARNs are not sensitive: only this repo can assume the roles, because of the OIDC trust policy. The email is a secret to keep it out of public logs.
 
-Under **Settings → Branches**, protect `main`: require a PR and require the CI checks to pass.
+**Or with the GitHub CLI**, using `gh auth login` first:
+```bash
+REPO=<owner>/<repo>
+out() { aws cloudformation describe-stacks --stack-name receiptlens-bootstrap \
+  --query "Stacks[0].Outputs[?OutputKey=='$1'].OutputValue" --output text; }
+gh variable set AWS_REGION             -R $REPO -b eu-central-1
+gh variable set AWS_PLAN_ROLE_ARN      -R $REPO -b "$(out PlanRoleArn)"
+gh variable set AWS_DEPLOY_ROLE_ARN    -R $REPO -b "$(out DeployRoleArn)"
+gh variable set CFN_EXECUTION_ROLE_ARN -R $REPO -b "$(out CloudFormationExecutionRoleArn)"
+gh variable set ARTIFACTS_BUCKET       -R $REPO -b "$(out ArtifactsBucket)"
+gh secret set   ALERT_EMAIL            -R $REPO
+```
+
+**The `prod` environment** (manual approval before every deploy):
+1. **Settings → Environments → New environment**. Name it exactly `prod`.
+2. Tick **Required reviewers** and add yourself.
+3. Under **Deployment branches and tags**, choose **Selected branches and tags** and add `main`.
+4. Optionally, untick **Allow administrators to bypass**.
+
+Required reviewers on a *private* repo need GitHub Pro, Team or Enterprise. On the free plan, make the repo public. There are no secrets in the code.
+
+**Protect `main`**, after the first run, so the check names exist and you can select them:
+1. **Settings → Rules → Rulesets → New branch ruleset**, target the default branch, enforcement **Active**.
+2. Enable **Restrict deletions** and **Block force pushes**.
+3. Enable **Require a pull request before merging** with **Required approvals = 0**. GitHub does not let you approve your own PR, so with 1 a solo maintainer is locked out.
+4. Enable **Require status checks to pass** and add:
+   - `Lint and test (Python)`
+   - `Lint CloudFormation and scripts`
+   - `IaC security scan (Checkov)`
+   - `Create change set`
 
 ### 3. Deploy
-Push to `main` (or open a PR first to see the change set), then approve the `prod` deployment in the Actions tab. The first deploy takes about 5–10 minutes, most of it creating the CloudFront distribution. When it finishes:
+Push the code, for example from the repo folder:
+```bash
+git init -b main
+git add .
+git update-index --chmod=+x scripts/*.sh   # keep the executable bit when committing from Windows
+git commit -m "Initial commit"
+git remote add origin https://github.com/<owner>/<repo>.git
+git push -u origin main
+```
 
-1. Confirm the SNS subscription email.
+The first push needs a GitHub credential that can write workflow files. Use one of these:
+- **Git Credential Manager**: a browser sign-in. It is the default with Git for Windows.
+- **A classic personal access token** with the `repo` **and** `workflow` scopes.
+- **A fine-grained token** for this repo only, with these permissions set to *Read and write*: Contents, Workflows, Variables, Secrets.
+
+Then in the **Actions** tab:
+1. **CI** runs ruff, pytest, cfn-lint, shellcheck and Checkov.
+2. **Deploy → Create change set** packages the Lambdas and creates the change set. The run **Summary** shows the resources it will add, modify or replace.
+3. **Deploy → Execute change set (prod)** waits at **Waiting for review**. Click **Review deployments → Approve and deploy**.
+
+The first deploy takes about 5–10 minutes, most of it creating the CloudFront distribution. You can follow it in **CloudFormation → receiptlens-prod → Events**. When it finishes:
+
+1. Confirm the SNS subscription email (*AWS Notification – Subscription Confirmation*). Without it, alarms won't reach you.
 2. Create your user:
    ```bash
-   aws cloudformation describe-stacks --stack-name receiptlens-prod \
-     --query "Stacks[0].Outputs[?OutputKey=='UserPoolId'].OutputValue" --output text
-   aws cognito-idp admin-create-user \
-     --user-pool-id <UserPoolId> \
+   POOL=$(aws cloudformation describe-stacks --stack-name receiptlens-prod \
+     --query "Stacks[0].Outputs[?OutputKey=='UserPoolId'].OutputValue" --output text)
+   aws cognito-idp admin-create-user --user-pool-id $POOL \
      --username you@example.com \
      --user-attributes Name=email,Value=you@example.com Name=email_verified,Value=true
    ```
-3. Open `WebUrl` from the job output, sign in with the temporary password from the email, and upload a receipt.
+3. Open `WebUrl` from the job output, sign in with the temporary password from the email, set a new one, and upload a receipt.
 
-If the very first deploy fails, the stack ends in `ROLLBACK_COMPLETE` and cannot be updated. Delete it once (`aws cloudformation delete-stack --stack-name receiptlens-prod`), fix the cause shown in the stack events, and push again.
+From then on, every change goes: branch → PR (CI and a change set comment) → merge → approve the deploy.
 
 ## Local development
 
@@ -205,6 +259,63 @@ pytest -q
 cfn-lint
 checkov -d infra -d bootstrap --config-file .checkov.yaml --compact
 ```
+
+## Troubleshooting
+
+Problems hit during real deployments of this project, in the order they tend to appear.
+
+| Symptom | Cause | Fix |
+| --- | --- | --- |
+| Bootstrap: `Failed to create the changeset ... [AWS::EarlyValidation::ResourceExistenceCheck]` | A resource with the same name already exists. Usually the GitHub OIDC provider, which the account can hold only once. | Pass `ExistingOidcProviderArn=...` (see *If the account already has a GitHub OIDC provider*). The stack stays in `REVIEW_IN_PROGRESS` meanwhile, which is harmless. |
+| Pipeline: `Could not assume role with OIDC: Not authorized to perform sts:AssumeRoleWithWebIdentity` | The token from GitHub doesn't match the role's trust policy. | Work through the checks below. |
+| Pipeline: `scripts/changeset.sh: Permission denied` (exit 126) | The repo was committed from Windows, so the scripts lost their executable bit. | The workflow calls scripts through `bash`, so this is already handled. Also run `git update-index --chmod=+x scripts/*.sh` and commit. |
+| `git push` rejected: *refusing to allow a Personal Access Token to create or update workflow* | The token lacks the `workflow` scope. | Use a token with `repo` + `workflow`, a fine-grained token with *Workflows: Read and write*, or Git Credential Manager. |
+| Bootstrap `deploy` says *No changes to deploy* after you fixed a value | The parameter values you passed are the same as before. | Check the parameter overrides you passed and confirm the result with `aws iam get-role` (below). |
+| Create change set: `Stack receiptlens-prod is in ROLLBACK_COMPLETE` | The very first create failed and rolled back. | In **CloudFormation → receiptlens-prod → Events**, find the first `CREATE_FAILED` reason. Run `aws cloudformation delete-stack --stack-name receiptlens-prod`, fix the cause, and re-run. |
+| No **Required reviewers** option on the `prod` environment | The repo is private on a free GitHub plan. | Make the repo public, or use a paid plan. |
+| Locked out of merging your own PRs | The ruleset requires 1 approval, and GitHub won't let you approve your own PR. | Set **Required approvals** to 0. The PR, CI and the deploy approval still apply. |
+| Upload works but stays at *Extracting…* | The extractor failed, often because the Bedrock model isn't available in the region. | Check `/aws/lambda/receiptlens-prod-extractor` in CloudWatch Logs, then confirm the model in the Bedrock console. Failed documents land in the DLQ after 3 attempts and trigger an alarm. |
+
+### Debugging the OIDC role assumption
+
+1. **See exactly what GitHub sent.** Query CloudTrail in the region the pipeline uses; events can take a few minutes to appear:
+   ```bash
+   aws cloudtrail lookup-events --region eu-central-1 \
+     --lookup-attributes AttributeKey=EventName,AttributeValue=AssumeRoleWithWebIdentity \
+     --max-results 5 --query 'Events[].CloudTrailEvent' --output text \
+     | jq -c '{time: .eventTime, error: .errorCode, sub: .userIdentity.userName, role: .requestParameters.roleArn}'
+   ```
+   If you look in another region, you see other projects' events, or nothing.
+2. **See what the roles accept:**
+   ```bash
+   for r in receiptlens-github-plan receiptlens-github-deploy; do
+     aws iam get-role --role-name $r \
+       --query 'Role.AssumeRolePolicyDocument.Statement[0].[Principal.Federated, Condition]' --output json
+   done
+   ```
+3. **Compare them.** The `sub` from step 1 must appear character for character in step 2. Typical mismatches:
+   - **The owner name has a typo or different capitalisation.** For example, `andrei369` vs `andreid369`. Copy the owner from the repo URL.
+   - **The token uses immutable IDs**, `repo:<owner>@<id>/<repo>@<id>:...`. Set `GitHubSubjectPrefix` to everything before `:ref:`.
+   - **The prefix includes `:ref:refs/heads/main`.** The template appends that suffix itself, so the role ends up expecting `...:ref:refs/heads/main:ref:refs/heads/main`. Remove it from the prefix.
+   - **You pushed to a branch other than `main`**, for example `master`. Rename the branch, or open a PR.
+4. **Check the provider audience.** It must include `sts.amazonaws.com`, which matters especially for a provider created by an older project:
+   ```bash
+   aws iam get-open-id-connect-provider \
+     --open-id-connect-provider-arn arn:aws:iam::<account-id>:oidc-provider/token.actions.githubusercontent.com \
+     --query ClientIDList
+   ```
+5. **If `role` in CloudTrail isn't the expected ARN**, the `AWS_PLAN_ROLE_ARN` or `AWS_DEPLOY_ROLE_ARN` repo variable is wrong. Copy it again from the bootstrap outputs.
+6. **If CloudTrail shows nothing yet**, print the subject from the workflow. Add this step before `configure-aws-credentials`; it shows only the claims, never the token:
+   ```yaml
+   - uses: actions/github-script@v7
+     with:
+       script: |
+         const t = await core.getIDToken('sts.amazonaws.com');
+         const c = JSON.parse(Buffer.from(t.split('.')[1], 'base64url').toString());
+         core.info(`sub = ${c.sub}`); core.info(`aud = ${c.aud}`);
+   ```
+
+The fix for any trust-policy mismatch is the same: redeploy the bootstrap with the corrected parameters. You don't need a new push; re-run the failed workflow afterwards.
 
 ## Changing the model
 
