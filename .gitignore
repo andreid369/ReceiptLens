@@ -1,0 +1,17 @@
+# CloudFormation / deploy outputs
+packaged.yaml
+changes.md
+web/config.js
+
+# Python
+__pycache__/
+*.pyc
+.pytest_cache/
+.ruff_cache/
+.venv/
+
+# OS / editors
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/

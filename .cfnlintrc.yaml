@@ -1,0 +1,5 @@
+templates:
+  - infra/template.yaml
+  - bootstrap/bootstrap.yaml
+ignore_checks:
+  - W3002 # local Code paths are intentional: `aws cloudformation package` uploads them

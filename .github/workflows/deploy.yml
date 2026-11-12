@@ -1,0 +1,105 @@
+name: Deploy
+
+on:
+  pull_request:
+    paths: ["infra/**", "app/**", "web/**", "scripts/**", ".github/workflows/deploy.yml"]
+  push:
+    branches: [main]
+    paths: ["infra/**", "app/**", "web/**", "scripts/**", ".github/workflows/deploy.yml"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# One stack, one operation at a time.
+concurrency:
+  group: cloudformation-prod
+  cancel-in-progress: false
+
+env:
+  AWS_REGION: ${{ vars.AWS_REGION }}
+  STACK_NAME: receiptlens-prod
+
+jobs:
+  changeset:
+    name: Create change set
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write       # OIDC token for AWS, no stored keys
+      pull-requests: write  # post the change set on the PR
+    outputs:
+      has_changes: ${{ steps.create.outputs.has_changes }}
+      change_set_name: ${{ steps.name.outputs.value }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_PLAN_ROLE_ARN }}   # read-only + create change sets
+          aws-region: ${{ vars.AWS_REGION }}
+          role-session-name: gha-changeset-${{ github.run_id }}
+
+      - id: name
+        run: echo "value=gh-${{ github.event.pull_request.number && format('pr{0}', github.event.pull_request.number) || 'main' }}-${{ github.run_id }}-${{ github.run_attempt }}" >> "$GITHUB_OUTPUT"
+
+      - id: create
+        env:
+          CHANGE_SET_NAME: ${{ steps.name.outputs.value }}
+          ARTIFACTS_BUCKET: ${{ vars.ARTIFACTS_BUCKET }}
+          CFN_EXECUTION_ROLE_ARN: ${{ vars.CFN_EXECUTION_ROLE_ARN }}
+          ALERT_EMAIL: ${{ secrets.ALERT_EMAIL }}
+          REPOSITORY: ${{ github.repository }}
+        run: scripts/changeset.sh create
+
+      - name: Job summary
+        if: always()
+        run: '[ -f changes.md ] && cat changes.md >> "$GITHUB_STEP_SUMMARY" || true'
+
+      - name: Comment change set on PR
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const body = require('fs').readFileSync('changes.md', 'utf8');
+            await github.rest.issues.createComment({ ...context.repo, issue_number: context.issue.number, body });
+
+      # A PR change set is for review only; main's change set is executed by the next job.
+      - name: Delete PR change set
+        if: always() && github.event_name == 'pull_request'
+        env:
+          CHANGE_SET_NAME: ${{ steps.name.outputs.value }}
+        run: scripts/changeset.sh delete
+
+  deploy:
+    name: Execute change set (prod)
+    needs: changeset
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    environment: prod   # manual approval; the deploy role trusts only this environment
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+          role-session-name: gha-deploy-${{ github.run_id }}
+
+      # Executes exactly the change set that was created and shown above.
+      - name: Execute change set
+        if: needs.changeset.outputs.has_changes == 'true'
+        env:
+          CHANGE_SET_NAME: ${{ needs.changeset.outputs.change_set_name }}
+        run: scripts/changeset.sh execute
+
+      - name: Publish web app
+        run: scripts/publish-web.sh
+
+      - name: Stack outputs
+        run: |
+          aws cloudformation describe-stacks --stack-name "$STACK_NAME" \
+            --query 'Stacks[0].Outputs[].[OutputKey,OutputValue]' --output table

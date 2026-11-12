@@ -1,0 +1,241 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  ReceiptLens bootstrap (deploy once, with admin rights, e.g. from CloudShell).
+  Creates what GitHub Actions needs before it can deploy anything: the GitHub
+  OIDC provider, a change-set ("plan") role for pull requests, a deploy role for
+  the protected prod environment, the CloudFormation execution role, and the
+  bucket that holds packaged Lambda code.
+
+Parameters:
+  GitHubOwner:
+    Type: String
+    Description: GitHub user or organisation that owns the repository
+  GitHubRepo:
+    Type: String
+    Description: Repository name, without the owner
+  Project:
+    Type: String
+    Default: receiptlens
+    AllowedPattern: "^[a-z0-9-]+$"
+  ExistingOidcProviderArn:
+    Type: String
+    Default: ""
+    Description: >
+      Leave empty to create the GitHub OIDC provider. An account can hold only
+      one provider per URL, so pass its ARN if it already exists.
+
+Conditions:
+  CreateOidcProvider: !Equals [!Ref ExistingOidcProviderArn, ""]
+
+Resources:
+  GitHubOidcProvider:
+    Type: AWS::IAM::OIDCProvider
+    Condition: CreateOidcProvider
+    Properties:
+      Url: https://token.actions.githubusercontent.com
+      ClientIdList: [sts.amazonaws.com]
+
+  # Packaged Lambda zips uploaded by `aws cloudformation package`.
+  ArtifactsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "${Project}-artifacts-${AWS::AccountId}"
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      VersioningConfiguration:
+        Status: Enabled
+      LifecycleConfiguration:
+        Rules:
+          - Id: expire-old-artifacts
+            Status: Enabled
+            ExpirationInDays: 30
+            NoncurrentVersionExpiration:
+              NoncurrentDays: 7
+            AbortIncompleteMultipartUpload:
+              DaysAfterInitiation: 1
+
+  ArtifactsBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref ArtifactsBucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: "*"
+            Action: "s3:*"
+            Resource:
+              - !GetAtt ArtifactsBucket.Arn
+              - !Sub "${ArtifactsBucket.Arn}/*"
+            Condition:
+              Bool:
+                aws:SecureTransport: "false"
+
+  # The role CloudFormation itself uses to create resources. GitHub roles never
+  # get these broad permissions directly: they can only hand this role to
+  # CloudFormation (iam:PassRole) for the project's own stacks.
+  CloudFormationExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${Project}-cfn-execution"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: cloudformation.amazonaws.com
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+      ManagedPolicyArns:
+        - !Sub "arn:${AWS::Partition}:iam::aws:policy/PowerUserAccess"
+      Policies:
+        - PolicyName: project-iam-only
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: ProjectRolesOnly
+                Effect: Allow
+                Action:
+                  - iam:CreateRole
+                  - iam:DeleteRole
+                  - iam:GetRole
+                  - iam:UpdateRole
+                  - iam:UpdateAssumeRolePolicy
+                  - iam:TagRole
+                  - iam:UntagRole
+                  - iam:PassRole
+                  - iam:PutRolePolicy
+                  - iam:GetRolePolicy
+                  - iam:DeleteRolePolicy
+                  - iam:AttachRolePolicy
+                  - iam:DetachRolePolicy
+                  - iam:ListRolePolicies
+                  - iam:ListAttachedRolePolicies
+                Resource: !Sub "arn:${AWS::Partition}:iam::${AWS::AccountId}:role/${Project}-*"
+              - Sid: ServiceLinkedRoles
+                Effect: Allow
+                Action: iam:CreateServiceLinkedRole
+                Resource: !Sub "arn:${AWS::Partition}:iam::${AWS::AccountId}:role/aws-service-role/*"
+
+  # Pull requests: read-only, plus creating (never executing) change sets.
+  GitHubPlanRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${Project}-github-plan"
+      MaxSessionDuration: 3600
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Federated: !If
+                - CreateOidcProvider
+                - !Ref GitHubOidcProvider
+                - !Ref ExistingOidcProviderArn
+            Action: sts:AssumeRoleWithWebIdentity
+            Condition:
+              StringEquals:
+                token.actions.githubusercontent.com:aud: sts.amazonaws.com
+                token.actions.githubusercontent.com:sub:
+                  - !Sub "repo:${GitHubOwner}/${GitHubRepo}:pull_request"
+                  - !Sub "repo:${GitHubOwner}/${GitHubRepo}:ref:refs/heads/main"
+      ManagedPolicyArns:
+        - !Sub "arn:${AWS::Partition}:iam::aws:policy/ReadOnlyAccess"
+      Policies:
+        - PolicyName: change-sets
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: ChangeSetsOnProjectStacks
+                Effect: Allow
+                Action:
+                  - cloudformation:CreateChangeSet
+                  - cloudformation:DeleteChangeSet
+                  - cloudformation:DescribeChangeSet
+                  - cloudformation:DescribeStacks
+                Resource: !Sub "arn:${AWS::Partition}:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/${Project}-*/*"
+              - Sid: UploadPackagedCode
+                Effect: Allow
+                Action: s3:PutObject
+                Resource: !Sub "${ArtifactsBucket.Arn}/*"
+              - Sid: HandExecutionRoleToCloudFormation
+                Effect: Allow
+                Action: iam:PassRole
+                Resource: !GetAtt CloudFormationExecutionRole.Arn
+                Condition:
+                  StringEquals:
+                    iam:PassedToService: cloudformation.amazonaws.com
+
+  # main branch, prod environment only (manual approval in GitHub).
+  GitHubDeployRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${Project}-github-deploy"
+      MaxSessionDuration: 3600
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Federated: !If
+                - CreateOidcProvider
+                - !Ref GitHubOidcProvider
+                - !Ref ExistingOidcProviderArn
+            Action: sts:AssumeRoleWithWebIdentity
+            Condition:
+              StringEquals:
+                token.actions.githubusercontent.com:aud: sts.amazonaws.com
+                token.actions.githubusercontent.com:sub: !Sub "repo:${GitHubOwner}/${GitHubRepo}:environment:prod"
+      Policies:
+        - PolicyName: deploy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: ExecuteReviewedChangeSets
+                Effect: Allow
+                Action:
+                  - cloudformation:ExecuteChangeSet
+                  - cloudformation:DescribeChangeSet
+                  - cloudformation:DescribeStacks
+                  - cloudformation:DescribeStackEvents
+                Resource: !Sub "arn:${AWS::Partition}:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/${Project}-*/*"
+              - Sid: HandExecutionRoleToCloudFormation
+                Effect: Allow
+                Action: iam:PassRole
+                Resource: !GetAtt CloudFormationExecutionRole.Arn
+                Condition:
+                  StringEquals:
+                    iam:PassedToService: cloudformation.amazonaws.com
+              - Sid: PublishWebApp
+                Effect: Allow
+                Action:
+                  - s3:ListBucket
+                  - s3:PutObject
+                  - s3:DeleteObject
+                Resource:
+                  - !Sub "arn:${AWS::Partition}:s3:::${Project}-*-web-${AWS::AccountId}"
+                  - !Sub "arn:${AWS::Partition}:s3:::${Project}-*-web-${AWS::AccountId}/*"
+
+Outputs:
+  PlanRoleArn:
+    Description: GitHub variable AWS_PLAN_ROLE_ARN
+    Value: !GetAtt GitHubPlanRole.Arn
+  DeployRoleArn:
+    Description: GitHub variable AWS_DEPLOY_ROLE_ARN
+    Value: !GetAtt GitHubDeployRole.Arn
+  CloudFormationExecutionRoleArn:
+    Description: GitHub variable CFN_EXECUTION_ROLE_ARN
+    Value: !GetAtt CloudFormationExecutionRole.Arn
+  ArtifactsBucket:
+    Description: GitHub variable ARTIFACTS_BUCKET
+    Value: !Ref ArtifactsBucket

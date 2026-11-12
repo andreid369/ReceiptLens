@@ -1,0 +1,723 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  ReceiptLens: serverless receipt and invoice extraction.
+  S3 -> EventBridge -> SQS (+DLQ) -> Lambda (Bedrock, Textract fallback) -> DynamoDB,
+  with a Cognito-protected HTTP API and a static web app on CloudFront.
+
+Parameters:
+  Project:
+    Type: String
+    Default: receiptlens
+    AllowedPattern: "^[a-z0-9-]+$"
+  Environment:
+    Type: String
+    Default: prod
+    AllowedPattern: "^[a-z0-9-]+$"
+  AlertEmail:
+    Type: String
+    Description: Receives alarms and budget alerts (confirm the SNS subscription email)
+    AllowedPattern: "^[^@\\s]+@[^@\\s]+\\.[^@\\s]+$"
+  BedrockModelId:
+    Type: String
+    Default: eu.amazon.nova-lite-v1:0
+    Description: Model or inference profile ID (must support images and tool use)
+  BedrockFoundationModel:
+    Type: String
+    Default: amazon.nova-lite-v1:0
+    Description: Underlying foundation model ID, needed in IAM for cross-region inference profiles
+  TextractFallback:
+    Type: String
+    Default: "true"
+    AllowedValues: ["true", "false"]
+  MonthlyBudgetUsd:
+    Type: Number
+    Default: 5
+  LogRetentionDays:
+    Type: Number
+    Default: 14
+    AllowedValues: [1, 3, 5, 7, 14, 30, 60, 90]
+  MaxUploadBytes:
+    Type: Number
+    Default: 3750000
+    Description: Bedrock accepts images up to 3.75 MB
+  ExtractorMaxConcurrency:
+    Type: Number
+    Default: 2
+    MinValue: 2
+    Description: Caps parallel extractions so bursts never hit Bedrock rate limits
+
+Resources:
+  # ---------------------------------------------------------------- storage --
+
+  DocumentsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "${Project}-${Environment}-documents-${AWS::AccountId}"
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      VersioningConfiguration:
+        Status: Enabled
+      NotificationConfiguration:
+        EventBridgeConfiguration:
+          EventBridgeEnabled: true
+      CorsConfiguration:
+        CorsRules:
+          - AllowedMethods: [POST]
+            AllowedOrigins: [!Sub "https://${Distribution.DomainName}"]
+            AllowedHeaders: ["*"]
+            MaxAge: 3600
+      LifecycleConfiguration:
+        Rules:
+          - Id: tier-uploads
+            Status: Enabled
+            Prefix: uploads/
+            Transitions:
+              - StorageClass: STANDARD_IA
+                TransitionInDays: 30
+            NoncurrentVersionExpiration:
+              NoncurrentDays: 30
+          - Id: abort-incomplete-uploads
+            Status: Enabled
+            AbortIncompleteMultipartUpload:
+              DaysAfterInitiation: 1
+
+  DocumentsBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref DocumentsBucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: "*"
+            Action: "s3:*"
+            Resource:
+              - !GetAtt DocumentsBucket.Arn
+              - !Sub "${DocumentsBucket.Arn}/*"
+            Condition:
+              Bool:
+                aws:SecureTransport: "false"
+
+  ExpensesTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub "${Project}-${Environment}-expenses"
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: tenant_id
+          AttributeType: S
+        - AttributeName: doc_id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: tenant_id
+          KeyType: HASH
+        - AttributeName: doc_id
+          KeyType: RANGE
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      SSESpecification:
+        SSEEnabled: true
+
+  # -------------------------------------------------------------- pipeline --
+
+  ExtractDeadLetterQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub "${Project}-${Environment}-extract-dlq"
+      MessageRetentionPeriod: 1209600 # 14 days to investigate failures
+      SqsManagedSseEnabled: true
+
+  ExtractQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub "${Project}-${Environment}-extract"
+      VisibilityTimeout: 360 # 6 x the extractor timeout (60 s)
+      MessageRetentionPeriod: 345600
+      SqsManagedSseEnabled: true
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt ExtractDeadLetterQueue.Arn
+        maxReceiveCount: 3
+
+  DocumentUploadedRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub "${Project}-${Environment}-document-uploaded"
+      Description: New document uploaded under uploads/
+      EventPattern:
+        source: [aws.s3]
+        detail-type: [Object Created]
+        detail:
+          bucket:
+            name: [!Ref DocumentsBucket]
+          object:
+            key: [{ prefix: uploads/ }]
+      Targets:
+        - Id: extract-queue
+          Arn: !GetAtt ExtractQueue.Arn
+
+  ExtractQueuePolicy:
+    Type: AWS::SQS::QueuePolicy
+    Properties:
+      Queues: [!Ref ExtractQueue]
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: events.amazonaws.com
+            Action: sqs:SendMessage
+            Resource: !GetAtt ExtractQueue.Arn
+            Condition:
+              ArnEquals:
+                aws:SourceArn: !GetAtt DocumentUploadedRule.Arn
+
+  # ------------------------------------------------------------- extractor --
+
+  ExtractorLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${Project}-${Environment}-extractor"
+      RetentionInDays: !Ref LogRetentionDays
+
+  ExtractorRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${Project}-${Environment}-extractor"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Sub "arn:${AWS::Partition}:iam::aws:policy/AWSXRayDaemonWriteAccess"
+      Policies:
+        - PolicyName: extractor
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: Logs
+                Effect: Allow
+                Action: [logs:CreateLogStream, logs:PutLogEvents]
+                Resource: !Sub "${ExtractorLogGroup.Arn}:*"
+              - Sid: ReadUploads
+                Effect: Allow
+                Action: s3:GetObject
+                Resource: !Sub "${DocumentsBucket.Arn}/uploads/*"
+              - Sid: Queue
+                Effect: Allow
+                Action: [sqs:ReceiveMessage, sqs:DeleteMessage, sqs:GetQueueAttributes]
+                Resource: !GetAtt ExtractQueue.Arn
+              - Sid: Expenses
+                Effect: Allow
+                Action: [dynamodb:GetItem, dynamodb:UpdateItem]
+                Resource: !GetAtt ExpensesTable.Arn
+              # A cross-region inference profile (eu.*) routes to several EU regions,
+              # so the role needs the profile plus the foundation model in any region.
+              - Sid: InvokeExtractionModel
+                Effect: Allow
+                Action: bedrock:InvokeModel
+                Resource:
+                  - !Sub "arn:${AWS::Partition}:bedrock:${AWS::Region}:${AWS::AccountId}:inference-profile/${BedrockModelId}"
+                  - !Sub "arn:${AWS::Partition}:bedrock:*::foundation-model/${BedrockFoundationModel}"
+              - Sid: TextractFallback
+                Effect: Allow
+                Action: textract:AnalyzeExpense
+                Resource: "*" # Textract has no resource-level permissions
+
+  ExtractorFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "${Project}-${Environment}-extractor"
+      Role: !GetAtt ExtractorRole.Arn
+      Runtime: python3.13
+      Architectures: [arm64]
+      Handler: handler.lambda_handler
+      Code: ../app/extractor # replaced with an S3 location by `aws cloudformation package`
+      MemorySize: 512
+      Timeout: 60
+      TracingConfig:
+        Mode: Active
+      LoggingConfig:
+        LogFormat: Text
+        LogGroup: !Ref ExtractorLogGroup
+      Environment:
+        Variables:
+          TABLE_NAME: !Ref ExpensesTable
+          MODEL_ID: !Ref BedrockModelId
+          TEXTRACT_FALLBACK: !Ref TextractFallback
+          MAX_DOCUMENT_BYTES: !Ref MaxUploadBytes
+          METRIC_NAMESPACE: ReceiptLens
+
+  ExtractorEventSourceMapping:
+    Type: AWS::Lambda::EventSourceMapping
+    Properties:
+      EventSourceArn: !GetAtt ExtractQueue.Arn
+      FunctionName: !Ref ExtractorFunction
+      BatchSize: 5
+      FunctionResponseTypes: [ReportBatchItemFailures]
+      ScalingConfig:
+        MaximumConcurrency: !Ref ExtractorMaxConcurrency
+
+  # ------------------------------------------------------------------- api --
+
+  ApiLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${Project}-${Environment}-api"
+      RetentionInDays: !Ref LogRetentionDays
+
+  ApiRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${Project}-${Environment}-api"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Sub "arn:${AWS::Partition}:iam::aws:policy/AWSXRayDaemonWriteAccess"
+      Policies:
+        - PolicyName: api
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: Logs
+                Effect: Allow
+                Action: [logs:CreateLogStream, logs:PutLogEvents]
+                Resource: !Sub "${ApiLogGroup.Arn}:*"
+              # The presigned POST is signed with this role, so it needs PutObject.
+              - Sid: SignUploads
+                Effect: Allow
+                Action: s3:PutObject
+                Resource: !Sub "${DocumentsBucket.Arn}/uploads/*"
+              - Sid: Expenses
+                Effect: Allow
+                Action: [dynamodb:PutItem, dynamodb:GetItem, dynamodb:Query]
+                Resource: !GetAtt ExpensesTable.Arn
+
+  ApiFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "${Project}-${Environment}-api"
+      Role: !GetAtt ApiRole.Arn
+      Runtime: python3.13
+      Architectures: [arm64]
+      Handler: api_handler.lambda_handler
+      Code: ../app/api
+      MemorySize: 256
+      Timeout: 10
+      TracingConfig:
+        Mode: Active
+      LoggingConfig:
+        LogFormat: Text
+        LogGroup: !Ref ApiLogGroup
+      Environment:
+        Variables:
+          BUCKET_NAME: !Ref DocumentsBucket
+          TABLE_NAME: !Ref ExpensesTable
+          MAX_UPLOAD_BYTES: !Ref MaxUploadBytes
+          UPLOAD_URL_TTL_SECONDS: "300"
+
+  UserPool:
+    Type: AWS::Cognito::UserPool
+    Properties:
+      UserPoolName: !Sub "${Project}-${Environment}"
+      UserPoolTier: LITE # 10,000 MAU free; Essentials is the (pricier) default
+      DeletionProtection: INACTIVE
+      UsernameAttributes: [email]
+      AutoVerifiedAttributes: [email]
+      AdminCreateUserConfig:
+        AllowAdminCreateUserOnly: true # demo: users are invited, no public sign-up
+      Policies:
+        PasswordPolicy:
+          MinimumLength: 12
+          RequireLowercase: true
+          RequireUppercase: true
+          RequireNumbers: true
+          RequireSymbols: false
+      AccountRecoverySetting:
+        RecoveryMechanisms:
+          - Name: verified_email
+            Priority: 1
+
+  UserPoolDomain:
+    Type: AWS::Cognito::UserPoolDomain
+    Properties:
+      Domain: !Sub "${Project}-${Environment}-${AWS::AccountId}"
+      UserPoolId: !Ref UserPool
+      ManagedLoginVersion: 1 # classic hosted UI, available on the Lite tier
+
+  UserPoolClient:
+    Type: AWS::Cognito::UserPoolClient
+    Properties:
+      ClientName: !Sub "${Project}-${Environment}-web"
+      UserPoolId: !Ref UserPool
+      GenerateSecret: false # public SPA client, uses PKCE
+      AllowedOAuthFlowsUserPoolClient: true
+      AllowedOAuthFlows: [code]
+      AllowedOAuthScopes: [openid, email]
+      SupportedIdentityProviders: [COGNITO]
+      CallbackURLs: [!Sub "https://${Distribution.DomainName}/"]
+      LogoutURLs: [!Sub "https://${Distribution.DomainName}/"]
+      ExplicitAuthFlows: [ALLOW_REFRESH_TOKEN_AUTH, ALLOW_USER_SRP_AUTH]
+      PreventUserExistenceErrors: ENABLED
+      AccessTokenValidity: 60
+      IdTokenValidity: 60
+      RefreshTokenValidity: 7
+      TokenValidityUnits:
+        AccessToken: minutes
+        IdToken: minutes
+        RefreshToken: days
+
+  HttpApi:
+    Type: AWS::ApiGatewayV2::Api
+    Properties:
+      Name: !Sub "${Project}-${Environment}"
+      ProtocolType: HTTP
+      CorsConfiguration:
+        AllowOrigins: [!Sub "https://${Distribution.DomainName}"]
+        AllowMethods: [GET, POST, OPTIONS]
+        AllowHeaders: [authorization, content-type]
+        MaxAge: 3600
+
+  JwtAuthorizer:
+    Type: AWS::ApiGatewayV2::Authorizer
+    Properties:
+      ApiId: !Ref HttpApi
+      Name: cognito
+      AuthorizerType: JWT
+      IdentitySource: ["$request.header.Authorization"]
+      JwtConfiguration:
+        Audience: [!Ref UserPoolClient]
+        Issuer: !Sub "https://cognito-idp.${AWS::Region}.amazonaws.com/${UserPool}"
+
+  ApiIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref HttpApi
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !GetAtt ApiFunction.Arn
+      PayloadFormatVersion: "2.0"
+
+  RouteCreateUpload:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref HttpApi
+      RouteKey: POST /uploads
+      Target: !Sub "integrations/${ApiIntegration}"
+      AuthorizationType: JWT
+      AuthorizerId: !Ref JwtAuthorizer
+
+  RouteListExpenses:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref HttpApi
+      RouteKey: GET /expenses
+      Target: !Sub "integrations/${ApiIntegration}"
+      AuthorizationType: JWT
+      AuthorizerId: !Ref JwtAuthorizer
+
+  RouteGetExpense:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref HttpApi
+      RouteKey: GET /expenses/{doc_id}
+      Target: !Sub "integrations/${ApiIntegration}"
+      AuthorizationType: JWT
+      AuthorizerId: !Ref JwtAuthorizer
+
+  RouteExport:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref HttpApi
+      RouteKey: GET /export
+      Target: !Sub "integrations/${ApiIntegration}"
+      AuthorizationType: JWT
+      AuthorizerId: !Ref JwtAuthorizer
+
+  ApiAccessLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/apigateway/${Project}-${Environment}"
+      RetentionInDays: !Ref LogRetentionDays
+
+  ApiStage:
+    Type: AWS::ApiGatewayV2::Stage
+    Properties:
+      ApiId: !Ref HttpApi
+      StageName: $default
+      AutoDeploy: true
+      DefaultRouteSettings:
+        ThrottlingBurstLimit: 20
+        ThrottlingRateLimit: 10
+      AccessLogSettings:
+        DestinationArn: !GetAtt ApiAccessLogGroup.Arn
+        Format: '{"requestId":"$context.requestId","routeKey":"$context.routeKey","status":"$context.status","latencyMs":"$context.responseLatency","sub":"$context.authorizer.claims.sub"}'
+
+  ApiInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref ApiFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub "arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${HttpApi}/*/*"
+
+  # ------------------------------------------------------------------- web --
+
+  WebBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "${Project}-${Environment}-web-${AWS::AccountId}"
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
+  WebOriginAccessControl:
+    Type: AWS::CloudFront::OriginAccessControl
+    Properties:
+      OriginAccessControlConfig:
+        Name: !Sub "${Project}-${Environment}-web"
+        OriginAccessControlOriginType: s3
+        SigningBehavior: always
+        SigningProtocol: sigv4
+
+  SecurityHeadersPolicy:
+    Type: AWS::CloudFront::ResponseHeadersPolicy
+    Properties:
+      ResponseHeadersPolicyConfig:
+        Name: !Sub "${Project}-${Environment}-security-headers"
+        SecurityHeadersConfig:
+          ContentTypeOptions:
+            Override: true
+          FrameOptions:
+            FrameOption: DENY
+            Override: true
+          ReferrerPolicy:
+            ReferrerPolicy: strict-origin-when-cross-origin
+            Override: true
+          StrictTransportSecurity:
+            AccessControlMaxAgeSec: 31536000
+            IncludeSubdomains: true
+            Override: true
+
+  Distribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Enabled: true
+        Comment: !Sub "${Project}-${Environment} web app"
+        DefaultRootObject: index.html
+        PriceClass: PriceClass_100
+        Origins:
+          - Id: web
+            DomainName: !GetAtt WebBucket.RegionalDomainName
+            OriginAccessControlId: !GetAtt WebOriginAccessControl.Id
+            S3OriginConfig:
+              OriginAccessIdentity: ""
+        DefaultCacheBehavior:
+          TargetOriginId: web
+          ViewerProtocolPolicy: redirect-to-https
+          AllowedMethods: [GET, HEAD]
+          CachedMethods: [GET, HEAD]
+          Compress: true
+          CachePolicyId: 4135ea2d-6df8-44a3-9df3-4b5a84be39ad # Managed-CachingDisabled: tiny app, always fresh
+          ResponseHeadersPolicyId: !Ref SecurityHeadersPolicy
+        ViewerCertificate:
+          CloudFrontDefaultCertificate: true
+
+  WebBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref WebBucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: CloudFrontOnly
+            Effect: Allow
+            Principal:
+              Service: cloudfront.amazonaws.com
+            Action: s3:GetObject
+            Resource: !Sub "${WebBucket.Arn}/*"
+            Condition:
+              StringEquals:
+                AWS:SourceArn: !Sub "arn:${AWS::Partition}:cloudfront::${AWS::AccountId}:distribution/${Distribution}"
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: "*"
+            Action: "s3:*"
+            Resource:
+              - !GetAtt WebBucket.Arn
+              - !Sub "${WebBucket.Arn}/*"
+            Condition:
+              Bool:
+                aws:SecureTransport: "false"
+
+  # ------------------------------------------------------------ monitoring --
+
+  AlertsTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub "${Project}-${Environment}-alerts"
+      Subscription:
+        - Protocol: email
+          Endpoint: !Ref AlertEmail
+
+  DlqNotEmptyAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${Project}-${Environment}-dlq-not-empty"
+      AlarmDescription: Documents failed extraction 3 times and are waiting in the DLQ
+      Namespace: AWS/SQS
+      MetricName: ApproximateNumberOfMessagesVisible
+      Dimensions:
+        - Name: QueueName
+          Value: !GetAtt ExtractDeadLetterQueue.QueueName
+      Statistic: Maximum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlertsTopic]
+      OKActions: [!Ref AlertsTopic]
+
+  ExtractorErrorsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${Project}-${Environment}-extractor-errors"
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref ExtractorFunction
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlertsTopic]
+
+  Api5xxAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${Project}-${Environment}-api-5xx"
+      Namespace: AWS/ApiGateway
+      MetricName: 5xx
+      Dimensions:
+        - Name: ApiId
+          Value: !Ref HttpApi
+        - Name: Stage
+          Value: $default
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlertsTopic]
+
+  # Cost guardrail on the AI part: alert if a day uses unusually many tokens.
+  BedrockTokenSpikeAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${Project}-${Environment}-bedrock-token-spike"
+      AlarmDescription: More than 2M Bedrock input tokens in a day
+      Namespace: ReceiptLens
+      MetricName: BedrockInputTokens
+      Statistic: Sum
+      Period: 86400
+      EvaluationPeriods: 1
+      Threshold: 2000000
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlertsTopic]
+
+  Dashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Properties:
+      DashboardName: !Sub "${Project}-${Environment}"
+      DashboardBody: !Sub |
+        {
+          "widgets": [
+            {"type": "metric", "x": 0, "y": 0, "width": 12, "height": 6, "properties": {
+              "title": "Documents", "region": "${AWS::Region}", "stat": "Sum", "period": 3600,
+              "metrics": [["ReceiptLens", "DocumentsProcessed"], [".", "NeedsReview"], [".", "TextractFallbacks"]]}},
+            {"type": "metric", "x": 12, "y": 0, "width": 12, "height": 6, "properties": {
+              "title": "Bedrock tokens", "region": "${AWS::Region}", "stat": "Sum", "period": 3600,
+              "metrics": [["ReceiptLens", "BedrockInputTokens"], [".", "BedrockOutputTokens"]]}},
+            {"type": "metric", "x": 0, "y": 6, "width": 12, "height": 6, "properties": {
+              "title": "Queue health", "region": "${AWS::Region}", "stat": "Maximum", "period": 300,
+              "metrics": [["AWS/SQS", "ApproximateNumberOfMessagesVisible", "QueueName", "${ExtractQueue.QueueName}"],
+                          ["...", "${ExtractDeadLetterQueue.QueueName}"]]}},
+            {"type": "metric", "x": 12, "y": 6, "width": 12, "height": 6, "properties": {
+              "title": "Extractor", "region": "${AWS::Region}", "period": 300,
+              "metrics": [["AWS/Lambda", "Errors", "FunctionName", "${ExtractorFunction}", {"stat": "Sum"}],
+                          [".", "Duration", ".", ".", {"stat": "p95"}]]}}
+          ]
+        }
+
+  MonthlyBudget:
+    Type: AWS::Budgets::Budget
+    Properties:
+      Budget:
+        BudgetName: !Sub "${Project}-${Environment}-monthly"
+        BudgetType: COST
+        TimeUnit: MONTHLY
+        BudgetLimit:
+          Amount: !Ref MonthlyBudgetUsd
+          Unit: USD
+      NotificationsWithSubscribers:
+        - Notification:
+            NotificationType: ACTUAL
+            ComparisonOperator: GREATER_THAN
+            Threshold: 80
+            ThresholdType: PERCENTAGE
+          Subscribers:
+            - SubscriptionType: EMAIL
+              Address: !Ref AlertEmail
+        - Notification:
+            NotificationType: FORECASTED
+            ComparisonOperator: GREATER_THAN
+            Threshold: 100
+            ThresholdType: PERCENTAGE
+          Subscribers:
+            - SubscriptionType: EMAIL
+              Address: !Ref AlertEmail
+
+Outputs:
+  WebUrl:
+    Value: !Sub "https://${Distribution.DomainName}"
+  ApiUrl:
+    Value: !GetAtt HttpApi.ApiEndpoint
+  UserPoolId:
+    Value: !Ref UserPool
+  UserPoolClientId:
+    Value: !Ref UserPoolClient
+  AuthDomain:
+    Value: !Sub "https://${UserPoolDomain}.auth.${AWS::Region}.amazoncognito.com"
+  WebBucketName:
+    Value: !Ref WebBucket
+  DocumentsBucketName:
+    Value: !Ref DocumentsBucket
+  DashboardUrl:
+    Value: !Sub "https://${AWS::Region}.console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards/dashboard/${Dashboard}"

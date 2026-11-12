@@ -1,0 +1,37 @@
+# Checkov runs in CI and fails the build on any finding not listed here.
+# Every skip is a deliberate trade-off for a low-cost portfolio deployment;
+# the reason is part of the design, not an oversight.
+framework:
+  - cloudformation
+  - github_actions
+skip-check:
+  # Encryption: AWS-managed keys are used everywhere. Customer-managed KMS keys
+  # cost $1/key/month each and add little for single-account demo data.
+  - CKV_AWS_158 # CloudWatch log groups with CMK
+  - CKV_AWS_119 # DynamoDB with CMK (AWS-owned key encryption is on)
+  - CKV_AWS_145 # S3 with KMS (SSE-S3 AES256 is on)
+  - CKV_AWS_173 # Lambda env vars with CMK (no secrets in env vars)
+  - CKV_AWS_27  # SQS with CMK (SQS-managed SSE is enabled; Checkov only recognises KMS)
+  - CKV_AWS_26  # SNS with CMK (CloudWatch alarms cannot publish to an aws/sns-encrypted topic)
+  # Logging and retention: 14-day retention keeps CloudWatch costs near zero.
+  - CKV_AWS_338 # 1-year log retention
+  - CKV_AWS_18  # S3 access logging (CloudTrail data events are the upgrade path)
+  - CKV_AWS_86  # CloudFront access logging
+  # Lambda
+  - CKV_AWS_117 # Lambda in a VPC: no private resources to reach; a VPC would need a NAT gateway (~$33/month)
+  - CKV_AWS_116 # Lambda DLQ: async invokes are not used; the SQS queue has its own DLQ
+  - CKV_AWS_115 # Reserved concurrency: new accounts start with a low concurrency quota; SQS maximum_concurrency caps the extractor
+  - CKV_AWS_272 # Code signing: deploys only come from the protected CI role
+  # CloudFront: default *.cloudfront.net certificate, no custom domain yet
+  - CKV_AWS_174 # Minimum TLS version needs a custom certificate
+  - CKV2_AWS_42 # Custom SSL certificate
+  - CKV_AWS_68  # WAF: ~$5+/month per web ACL; API Gateway throttling is in place
+  - CKV2_AWS_47 # WAF managed rules (follows from CKV_AWS_68)
+  - CKV_AWS_374 # Geo restriction
+  - CKV_AWS_310 # Origin failover
+  - CKV_AWS_259 # HSTS preload (HSTS itself is enforced)
+  # S3
+  - CKV_AWS_144 # Cross-region replication doubles storage cost
+  - CKV2_AWS_62 # Event notifications on the static web bucket are not needed
+  - CKV2_AWS_61 # Lifecycle on the web bucket (three small static files)
+  - CKV_AWS_21  # Versioning on the web bucket (files are rebuilt from git)

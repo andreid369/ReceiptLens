@@ -1,0 +1,12 @@
+[tool.ruff]
+line-length = 110
+target-version = "py313"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["handler", "api_handler", "schema", "validation"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
