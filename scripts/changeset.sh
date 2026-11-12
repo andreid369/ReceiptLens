@@ -95,11 +95,12 @@ create() {
 }
 
 execute() {
-  local type
-  type="$(aws cloudformation describe-change-set --stack-name "$STACK_NAME" \
-    --change-set-name "$CHANGE_SET_NAME" --query ChangeSetType --output text 2>/dev/null || echo UPDATE)"
+  # DescribeChangeSet does not return the change set type, so decide from the
+  # stack status: a stack that was never created sits in REVIEW_IN_PROGRESS.
+  local before
+  before="$(stack_status)"
   aws cloudformation execute-change-set --stack-name "$STACK_NAME" --change-set-name "$CHANGE_SET_NAME"
-  if [[ "$type" == "CREATE" ]]; then
+  if [[ "$before" == "REVIEW_IN_PROGRESS" ]]; then
     aws cloudformation wait stack-create-complete --stack-name "$STACK_NAME"
   else
     aws cloudformation wait stack-update-complete --stack-name "$STACK_NAME"
