@@ -50,7 +50,7 @@ jobs:
           CFN_EXECUTION_ROLE_ARN: ${{ vars.CFN_EXECUTION_ROLE_ARN }}
           ALERT_EMAIL: ${{ secrets.ALERT_EMAIL }}
           REPOSITORY: ${{ github.repository }}
-        run: scripts/changeset.sh create
+        run: bash scripts/changeset.sh create
 
       - name: Job summary
         if: always()
@@ -69,7 +69,7 @@ jobs:
         if: always() && github.event_name == 'pull_request'
         env:
           CHANGE_SET_NAME: ${{ steps.name.outputs.value }}
-        run: scripts/changeset.sh delete
+        run: bash scripts/changeset.sh delete
 
   deploy:
     name: Execute change set (prod)
@@ -94,10 +94,10 @@ jobs:
         if: needs.changeset.outputs.has_changes == 'true'
         env:
           CHANGE_SET_NAME: ${{ needs.changeset.outputs.change_set_name }}
-        run: scripts/changeset.sh execute
+        run: bash scripts/changeset.sh execute
 
       - name: Publish web app
-        run: scripts/publish-web.sh
+        run: bash scripts/publish-web.sh
 
       - name: Stack outputs
         run: |

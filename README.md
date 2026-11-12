@@ -101,6 +101,26 @@ aws cloudformation describe-stacks --stack-name receiptlens-bootstrap \
 ```
 `GitHubOwner` and `GitHubRepo` must match GitHub exactly, including capitalisation: the role trust check is case-sensitive.
 
+#### If GitHub sends the OIDC subject with numeric IDs
+Some accounts send the token's `sub` with immutable IDs, in the form `repo:<owner>@<owner-id>/<repo>@<repo-id>:ref:refs/heads/main`, instead of `repo:<owner>/<repo>:ref:refs/heads/main`. The first pipeline run then fails with `Not authorized to perform sts:AssumeRoleWithWebIdentity`. To fix it:
+
+```bash
+# 1. See the exact sub GitHub sent (the region where the pipeline runs)
+aws cloudtrail lookup-events --region eu-central-1 \
+  --lookup-attributes AttributeKey=EventName,AttributeValue=AssumeRoleWithWebIdentity \
+  --max-results 5 --query 'Events[].CloudTrailEvent' --output text \
+  | jq -c '{time: .eventTime, error: .errorCode, sub: .userIdentity.userName}'
+#    → repo:alice@1234567/ReceiptLens@98765432:ref:refs/heads/main
+
+# 2. Redeploy the bootstrap with everything BEFORE ":ref:" as the prefix
+aws cloudformation deploy --stack-name receiptlens-bootstrap \
+  --template-file bootstrap/bootstrap.yaml --capabilities CAPABILITY_NAMED_IAM \
+  --parameter-overrides GitHubOwner=alice GitHubRepo=ReceiptLens \
+    GitHubSubjectPrefix='repo:alice@1234567/ReceiptLens@98765432'
+```
+
+The template appends `:pull_request` and `:ref:refs/heads/main` for the plan role, and `:environment:prod` for the deploy role. CloudTrail can take a few minutes to show new events.
+
 You can also deploy the same file from the CloudFormation console with **Create stack → Upload a template file**.
 
 #### If the account already has a GitHub OIDC provider
