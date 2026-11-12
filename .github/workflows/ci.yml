@@ -11,10 +11,10 @@ permissions:
 jobs:
   python:
     name: Lint and test (Python)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.13"
       - run: pip install pytest==8.3.5 ruff==0.11.13 boto3
@@ -23,10 +23,10 @@ jobs:
 
   templates:
     name: Lint CloudFormation and scripts
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.13"
       - run: pip install cfn-lint==1.60.0
@@ -35,10 +35,10 @@ jobs:
 
   security:
     name: IaC security scan (Checkov)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.13"
       - run: pip install checkov==3.4.3
