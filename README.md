@@ -61,6 +61,11 @@ docs/architecture.*       Architecture diagram (PNG for the README, .drawio to e
   - Every pull request gets a comment listing the resources the change set would add, modify or replace. The change set is deleted afterwards.
   - On `main`, the same kind of change set is created and shown in the job summary. After approval, the deploy job executes exactly that change set.
 - **No state bucket.** CloudFormation keeps the state of the stack itself, so there is no state file to store, lock or lose.
+- **Browser sessions.**
+  - Tokens are kept in memory only, never in browser storage.
+  - **Sign in** always shows the Cognito password form, because any earlier hosted-UI session is ended first.
+  - A refresh, a new tab or 15 minutes without activity signs the user out.
+  - The API rejects any request without a valid token (`401`), whatever the page shows.
 - **Checks on every change.** cfn-lint and shellcheck lint the templates and scripts. Checkov fails the build on any finding not listed in `.checkov.yaml`, and every listed skip states its reason.
 - **Reproducible runners.**
   - Jobs run on a pinned `ubuntu-24.04` image, not `ubuntu-latest`, so a runner OS migration can't change builds unannounced. Moving to `ubuntu-26.04` is a deliberate one-line PR.

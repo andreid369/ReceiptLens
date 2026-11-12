@@ -1,19 +1,49 @@
 // ReceiptLens web client: Cognito hosted UI (authorization code + PKCE),
 // direct-to-S3 uploads with a presigned POST, and the expenses list.
+//
+// Session rules:
+//  - Tokens live in memory only. A refresh, a new tab or closing the tab means
+//    signing in again; no tokens are left in browser storage.
+//  - "Sign in" always shows the password form: it first ends any Cognito
+//    session (the hosted UI cookie), then starts a fresh login.
+//  - 15 minutes without activity signs the user out.
 const cfg = window.RECEIPTLENS_CONFIG;
 const $ = (id) => document.getElementById(id);
-const store = window.sessionStorage;
+const IDLE_LIMIT_MS = 15 * 60 * 1000;
+
+// Only the short-lived PKCE values and one-shot flags survive the redirect to
+// Cognito and back; they are removed as soon as they are used.
+const flow = {
+  get: (k) => { try { return sessionStorage.getItem(k); } catch { return null; } },
+  set: (k, v) => { try { sessionStorage.setItem(k, v); } catch { /* storage blocked */ } },
+  take: (k) => { const v = flow.get(k); try { sessionStorage.removeItem(k); } catch { /* ignore */ } return v; },
+};
+
+let session = null; // { accessToken, email, exp }
 
 // ---------- auth (PKCE) ----------
 const b64url = (bytes) => btoa(String.fromCharCode(...new Uint8Array(bytes)))
   .replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
 
-async function login() {
+function claims(token) {
+  try { return JSON.parse(atob(token.split(".")[1].replace(/-/g, "+").replace(/_/g, "/"))); }
+  catch { return null; }
+}
+
+// Step 1 of "Sign in": end any existing Cognito session so the password form is shown.
+function signIn() {
+  flow.set("login_after_logout", "1");
+  const params = new URLSearchParams({ client_id: cfg.clientId, logout_uri: cfg.redirectUri });
+  location.assign(`${cfg.authDomain}/logout?${params}`);
+}
+
+// Step 2: back from /logout, start the authorization-code + PKCE login.
+async function startLogin() {
   const verifier = b64url(crypto.getRandomValues(new Uint8Array(32)));
   const challenge = b64url(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(verifier)));
   const state = b64url(crypto.getRandomValues(new Uint8Array(16)));
-  store.setItem("pkce_verifier", verifier);
-  store.setItem("oauth_state", state);
+  flow.set("pkce_verifier", verifier);
+  flow.set("oauth_state", state);
   const params = new URLSearchParams({
     response_type: "code", client_id: cfg.clientId, redirect_uri: cfg.redirectUri,
     scope: "openid email", code_challenge_method: "S256", code_challenge: challenge, state,
@@ -21,43 +51,57 @@ async function login() {
   location.assign(`${cfg.authDomain}/oauth2/authorize?${params}`);
 }
 
-async function handleRedirect() {
+// Step 3: back from Cognito with ?code=..., exchange it for tokens (kept in memory).
+async function finishLogin() {
   const params = new URLSearchParams(location.search);
   const code = params.get("code");
-  if (!code) return;
+  if (!code) return false;
   history.replaceState({}, "", cfg.redirectUri);
-  if (params.get("state") !== store.getItem("oauth_state")) throw new Error("state mismatch");
+  const verifier = flow.take("pkce_verifier");
+  if (!verifier || params.get("state") !== flow.take("oauth_state")) throw new Error("Sign-in expired, please try again.");
   const res = await fetch(`${cfg.authDomain}/oauth2/token`, {
     method: "POST",
     headers: { "Content-Type": "application/x-www-form-urlencoded" },
     body: new URLSearchParams({
       grant_type: "authorization_code", client_id: cfg.clientId, code,
-      redirect_uri: cfg.redirectUri, code_verifier: store.getItem("pkce_verifier"),
+      redirect_uri: cfg.redirectUri, code_verifier: verifier,
     }),
   });
-  if (!res.ok) throw new Error(`token exchange failed (${res.status})`);
+  if (!res.ok) throw new Error(`Sign-in failed (${res.status}), please try again.`);
   const tokens = await res.json();
-  store.setItem("access_token", tokens.access_token);
-  store.setItem("id_token", tokens.id_token);
-  store.removeItem("pkce_verifier");
-  store.removeItem("oauth_state");
+  const access = claims(tokens.access_token);
+  session = {
+    accessToken: tokens.access_token,
+    email: claims(tokens.id_token)?.email || "",
+    exp: access ? access.exp * 1000 : 0,
+  };
+  return true;
 }
 
-function logout() {
-  store.clear();
+// Sign out: forget the tokens and end the Cognito session.
+function signOut(reason) {
+  session = null;
+  if (reason) flow.set("signed_out_reason", reason);
   const params = new URLSearchParams({ client_id: cfg.clientId, logout_uri: cfg.redirectUri });
   location.assign(`${cfg.authDomain}/logout?${params}`);
 }
 
-function claims(token) {
-  try { return JSON.parse(atob(token.split(".")[1].replace(/-/g, "+").replace(/_/g, "/"))); }
-  catch { return null; }
+function token() {
+  if (!session) return null;
+  if (session.exp <= Date.now() + 30000) { signOut("Your session expired. Please sign in again."); return null; }
+  return session.accessToken;
 }
 
-function token() {
-  const t = store.getItem("access_token");
-  const c = t && claims(t);
-  return c && c.exp * 1000 > Date.now() + 30000 ? t : null;
+// ---------- inactivity timeout ----------
+let idleTimer;
+function resetIdleTimer() {
+  clearTimeout(idleTimer);
+  idleTimer = setTimeout(() => signOut("You were signed out after 15 minutes without activity."), IDLE_LIMIT_MS);
+}
+function watchActivity() {
+  ["pointerdown", "keydown", "scroll", "touchstart"].forEach((ev) =>
+    window.addEventListener(ev, resetIdleTimer, { passive: true }));
+  resetIdleTimer();
 }
 
 // ---------- API ----------
@@ -66,7 +110,7 @@ async function api(path, options = {}) {
     ...options,
     headers: { Authorization: `Bearer ${token()}`, "Content-Type": "application/json", ...(options.headers || {}) },
   });
-  if (res.status === 401) { store.clear(); location.reload(); }
+  if (res.status === 401) { signOut("Your session expired. Please sign in again."); throw new Error("Signed out"); }
   if (!res.ok) throw new Error((await res.json().catch(() => ({}))).error || `HTTP ${res.status}`);
   return res;
 }
@@ -144,17 +188,31 @@ async function exportCsv() {
 }
 
 // ---------- wiring ----------
-async function main() {
-  $("login").onclick = login;
-  $("logout").onclick = logout;
-  try { await handleRedirect(); } catch (err) { console.error(err); }
+function showSignedOut(message) {
+  $("login").hidden = false;
+  $("logout").hidden = true;
+  $("app").hidden = true;
+  $("signed-out").hidden = false;
+  if (message) $("signed-out").textContent = message;
+}
 
-  if (!token()) return;
+async function main() {
+  $("login").onclick = signIn;
+  $("logout").onclick = () => signOut();
+
+  // Back from /logout as part of "Sign in": continue to the login form.
+  if (flow.take("login_after_logout")) { await startLogin(); return; }
+
+  let signedIn = false;
+  try { signedIn = await finishLogin(); } catch (err) { showSignedOut(err.message); return; }
+  if (!signedIn || !token()) { showSignedOut(flow.take("signed_out_reason")); return; }
+
   $("login").hidden = true;
   $("logout").hidden = false;
   $("signed-out").hidden = true;
   $("app").hidden = false;
-  $("user").textContent = claims(store.getItem("id_token"))?.email || "";
+  $("user").textContent = session.email;
+  watchActivity();
 
   $("upload-form").onsubmit = async (ev) => {
     ev.preventDefault();
