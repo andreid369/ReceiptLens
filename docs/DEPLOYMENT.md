@@ -121,7 +121,30 @@ aws cognito-idp admin-disable-user --user-pool-id $POOL --username user@example.
 aws cognito-idp admin-delete-user  --user-pool-id $POOL --username user@example.com
 ```
 
-Each user is their own tenant: documents and expenses are keyed by the user's Cognito `sub`.
+Each user is their own tenant: documents and expenses are keyed by the user's Cognito `sub`. There are no roles; every account is a normal user.
+
+### Demo user (no email, permanent password)
+Use this to hand an interviewer a working login on the spot:
+```bash
+DEMO=demo@receiptlens.test
+PASS='Demo-ReceiptLens-2026'   # min 12 chars, upper + lower + digit
+
+aws cognito-idp admin-create-user --user-pool-id $POOL \
+  --username $DEMO --message-action SUPPRESS \
+  --user-attributes Name=email,Value=$DEMO Name=email_verified,Value=true
+
+aws cognito-idp admin-set-user-password --user-pool-id $POOL \
+  --username $DEMO --password "$PASS" --permanent
+```
+- **`--message-action SUPPRESS`** sends no email, so the address doesn't need to exist.
+- **`--permanent`** skips the first-sign-in password change.
+- **Check the status:** the user should show as `CONFIRMED` in `list-users`. Users invited by email stay `FORCE_CHANGE_PASSWORD` until their first sign-in.
+- **Afterwards:** disable the account (`admin-disable-user`, reversible) or delete it (`admin-delete-user`). Deleting an account does not delete its documents. Remove those by `sub` (see [Data](#5-data)).
+
+### From the console
+Cognito → User pools → `receiptlens-prod` → Users → **Create user**.
+- **Normal user:** choose **Send an email invitation**.
+- **Demo user:** choose **Don't send an invitation** and **Set a password**. Console passwords are temporary, so make it permanent with `admin-set-user-password ... --permanent`.
 
 ---
 
@@ -221,11 +244,12 @@ Delete `receiptlens-bootstrap` only if you are done with CI/CD for good. Empty i
 
 ## 8. Demo checklist (interview)
 
-1. **Show the code path:** a small PR, its CI checks and the change set comment.
-2. **Merge, approve the deploy,** and point out the read-only plan role vs the execute-only deploy role.
-3. **Open the web app** and upload a real receipt. It shows up as `EXTRACTED` within seconds.
-4. **Upload a blurry or partial receipt.** It shows up as `NEEDS_REVIEW` with the validation issues listed. Explain the Textract fallback.
-5. **Show the dashboard:** tokens per document, the fallback rate, and the queue staying at 0.
-6. **Open an X-Ray trace** of one extraction.
-7. **Talk through cost:** the budget, the tag filter in Cost Explorer, and the `.checkov.yaml` list of deliberate trade-offs (no NAT, no WAF, no customer-managed KMS keys) with their reasons.
-8. **Tell the troubleshooting story:** OIDC subject with immutable IDs, the bootstrap region, and how CloudTrail made each one visible.
+1. **Before the interview,** create a demo user (see [Users](#3-users)) and give its email and password to the interviewer if they want to try the app.
+2. **Show the code path:** a small PR, its CI checks and the change set comment.
+3. **Merge, approve the deploy,** and point out the read-only plan role vs the execute-only deploy role.
+4. **Open the web app** and upload a real receipt. It shows up as `EXTRACTED` within seconds.
+5. **Upload a blurry or partial receipt.** It shows up as `NEEDS_REVIEW` with the validation issues listed. Explain the Textract fallback.
+6. **Show the dashboard:** tokens per document, the fallback rate, and the queue staying at 0.
+7. **Open an X-Ray trace** of one extraction.
+8. **Talk through cost:** the budget, the tag filter in Cost Explorer, and the `.checkov.yaml` list of deliberate trade-offs (no NAT, no WAF, no customer-managed KMS keys) with their reasons.
+9. **Tell the troubleshooting story:** OIDC subject with immutable IDs, the bootstrap region, and how CloudTrail made each one visible.
